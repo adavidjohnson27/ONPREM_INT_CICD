@@ -1,253 +1,412 @@
 ##############################################################################################################
 #                                                                                                            #
-# initialize_pipeline.yml : Initialize OnPrem webMethods project and build/deploy pipeline                  #
-# GitHub Actions - Adapted for webMethods OnPrem from iPaaS pipeline                                        #
+# initialize_pipeline_onprem.yml : Initialize the repository and play/build stage                           #
+# GitHub Actions — webMethods Integration Server ON-PREMISES                                                #
 #                                                                                                            #
 # ####### Inputs ########                                                                                    #
-# packageList:        (Optional) Comma separated list of IS package names to build                          #
-# testPackageList:    (Optional) Comma separated list of test package names                                 #
-# devUser:            (Optional) UserID for commits and audit                                                #
-# featureBranchName:  (Mandatory) Name of the feature branch                                                 #
-# repoName:           (Mandatory) Name of the corresponding repository                                       #
-# buildAll:           (Mandatory) True to build all packages in the project                                  #
+# assetIDList:       (Optional) Comma separated list of asset IDs to be imported                            #
+# assetNameList:     (Optional) Comma separated asset name list                                             #
+# assetTypeList:     (Optional) Comma separated asset type list                                             #
+#                    Supported: flow, dsp, spec, ns (namespace/package)                                     #
+# devUser:           (Optional) UserID for commits and audit                                                 #
+# featureBranchName: (Mandatory) Name of the feature branch                                                 #
+# repoName:          (Mandatory) Name of the corresponding repository                                       #
+# synchProject:      (Mandatory) True to synchronize complete project.                                      #
+#                    If false, assetID and assetType must be provided                                       #
+#                                                                                                            #
+# ####### On-Prem Prerequisites ########                                                                     #
+# 1. Self-hosted GitHub runner installed on IS machine (or same network)                                    #
+# 2. WmDeployer package installed on Integration Server                                                      #
+# 3. GitHub Secrets configured:                                                                             #
+#      IS_USER       - Integration Server admin username                                                    #
+#      IS_PWD        - Integration Server admin password                                                    #
+#      PAT           - GitHub Personal Access Token                                                          #
+# 4. GitHub Variables configured:                                                                            #
+#      GIT_OWNER     - GitHub org/user name                                                                 #
+#      IS_HOST       - IS hostname (e.g. localhost or server IP)                                            #
+#      IS_PORT       - IS HTTP port (e.g. 5555)                                                             #
+#      IS_HOME       - Path to IS install (e.g. C:\SoftwareAG\IntegrationServer\instances\default)          #
+#      DEPLOYER_BAT  - Full path to Deployer.bat                                                            #
 ##############################################################################################################
 
-name: Initialize OnPrem Pipeline
+name: Initialize Pipeline (On-Prem IS)
 
 on:
   workflow_dispatch:
     inputs:
-      packageList:
-        description: "(Optional) Comma separated list of IS package names"
+      assetIDList:
+        description: "(Optional) Comma separated list of asset IDs to import"
         required: false
         default: ""
-      testPackageList:
-        description: "(Optional) Comma separated list of test package names"
+      assetNameList:
+        description: "(Optional) Comma separated asset name list"
+        required: false
+        default: ""
+      assetTypeList:
+        description: "(Optional) Comma separated asset type list (flow, dsp, spec, ns)"
         required: false
         default: ""
       devUser:
         description: "(Optional) User ID for commits and audit"
         required: false
-        default: ""
+        default: "cicd-bot"
       featureBranchName:
         description: "(Mandatory) Name of the feature branch"
         required: true
       repoName:
-        description: "(Mandatory) Name of the corresponding repository"
+        description: "(Mandatory) Name of the corresponding repository (maps to IS Package name)"
         required: true
-      buildAll:
-        description: "(Mandatory) Set to 'true' to build all packages"
+      synchProject:
+        description: "(Mandatory) Set to 'true' to synchronize the complete project/package"
         required: true
         default: "false"
 
 env:
   INIT: "true"
   REPO_PATH: "${{ vars.GIT_OWNER }}/${{ github.event.inputs.repoName }}"
-  SAG_HOME: ${{ github.workspace }}/sag_home
-  SAG_CI_HOME: ${{ github.workspace }}/sagdevops-ci-assets
+  IS_BASE_URL: "http://${{ vars.IS_HOST }}:${{ vars.IS_PORT }}"
+  DEPLOYER: "${{ vars.DEPLOYER_BAT }}"
+  PACKAGE_NAME: "${{ github.event.inputs.repoName }}"
 
 jobs:
   initialize:
+    # ── Must run on self-hosted runner with network access to IS ────────────────
     runs-on: self-hosted
 
     steps:
-      # ── 1. Checkout Repository ──────────────────────────────────────────────────────
-      - name: Checkout Repository
+      # ── 1. Checkout the pipeline/template repository ─────────────────────────
+      - name: Checkout Pipeline Repository
         uses: actions/checkout@v4
         with:
           submodules: "true"
           persist-credentials: "true"
           clean: "true"
+          token: ${{ secrets.PAT }}
 
-      # ── 2. Checkout CI Assets ───────────────────────────────────────────────────────
-      - name: Checkout CI Assets
-        uses: actions/checkout@v4
-        with:
-          repository: SoftwareAG/sagdevops-ci-assets
-          path: sagdevops-ci-assets
-          ref: master
-
-      # ── 3. Adjust variables when buildAll = true ────────────────────────────────────
-      - name: Adjust Variables for Full Build
-        if: ${{ github.event.inputs.buildAll == 'true' }}
+      # ── 2. Validate mandatory inputs ──────────────────────────────────────────
+      - name: Validate Inputs
+        shell: bash
         run: |
-          echo "PACKAGE_LIST=ALL"      >> $GITHUB_ENV
-          echo "TEST_PACKAGE_LIST=ALL" >> $GITHUB_ENV
+          echo "=== Input Validation ==="
+          if [ -z "${{ github.event.inputs.featureBranchName }}" ]; then
+            echo "::error::featureBranchName is required"
+            exit 1
+          fi
+          if [ -z "${{ github.event.inputs.repoName }}" ]; then
+            echo "::error::repoName is required"
+            exit 1
+          fi
+          if [ "${{ github.event.inputs.synchProject }}" != "true" ]; then
+            if [ -z "${{ github.event.inputs.assetIDList }}" ] && \
+               [ -z "${{ github.event.inputs.assetTypeList }}" ]; then
+              echo "::error::When synchProject=false, assetIDList and assetTypeList are required"
+              exit 1
+            fi
+          fi
+          echo "✅ All inputs validated"
 
-      - name: Set Package Variables from Inputs
-        if: ${{ github.event.inputs.buildAll != 'true' }}
+      # ── 3. Adjust asset variables based on synchProject flag ─────────────────
+      - name: Set Asset Variables (Full Sync)
+        if: ${{ github.event.inputs.synchProject == 'true' }}
+        shell: bash
         run: |
-          echo "PACKAGE_LIST=${{ github.event.inputs.packageList }}"         >> $GITHUB_ENV
-          echo "TEST_PACKAGE_LIST=${{ github.event.inputs.testPackageList }}" >> $GITHUB_ENV
+          echo "ASSET_ID_LIST=NA"   >> $GITHUB_ENV
+          echo "ASSET_TYPE_LIST=NA" >> $GITHUB_ENV
+          echo "ASSET_NAME_LIST=NA" >> $GITHUB_ENV
+          echo "SYNC_MODE=full"     >> $GITHUB_ENV
+          echo "ℹ️  Full project sync mode enabled"
 
-      # ── 4. Get environment configuration ────────────────────────────────────────────
-      - name: Get Environment Configuration
+      - name: Set Asset Variables (Partial Sync)
+        if: ${{ github.event.inputs.synchProject != 'true' }}
+        shell: bash
         run: |
-          pwd
-          ls -ltr
+          echo "ASSET_ID_LIST=${{ github.event.inputs.assetIDList }}"     >> $GITHUB_ENV
+          echo "ASSET_TYPE_LIST=${{ github.event.inputs.assetTypeList }}" >> $GITHUB_ENV
+          echo "ASSET_NAME_LIST=${{ github.event.inputs.assetNameList }}" >> $GITHUB_ENV
+          echo "SYNC_MODE=partial"                                         >> $GITHUB_ENV
+          echo "ℹ️  Partial sync mode — assets: ${{ github.event.inputs.assetIDList }}"
 
-          # Set default values for OnPrem environment
-          echo "DEPLOYER_HOST=${{ secrets.DEPLOYER_HOST || 'localhost' }}"     >> $GITHUB_ENV
-          echo "DEPLOYER_PORT=${{ secrets.DEPLOYER_PORT || '5555' }}"          >> $GITHUB_ENV
-          echo "TARGET_IS_HOST=${{ secrets.TARGET_IS_HOST || 'localhost' }}"   >> $GITHUB_ENV
-          echo "TARGET_IS_PORT=${{ secrets.TARGET_IS_PORT || '5555' }}"        >> $GITHUB_ENV
-          echo "REPO_USER=${{ vars.GIT_OWNER }}"                               >> $GITHUB_ENV
+      # ── 4. Load environment config from play.yml (on-prem IS settings) ───────
+      - name: Load Environment Config
+        shell: bash
+        run: |
+          echo "=== Loading Environment Config ==="
+          if [ ! -f "configs/env/play.yml" ]; then
+            echo "::warning::configs/env/play.yml not found — using GitHub vars instead"
+            echo "SOURCE_ENV_HOSTNAME=${{ vars.IS_HOST }}" >> $GITHUB_ENV
+            echo "SOURCE_ENV_PORT=${{ vars.IS_PORT }}"     >> $GITHUB_ENV
+            echo "SOURCE_TYPE=onprem"                      >> $GITHUB_ENV
+          else
+            echo "SOURCE_ENV_HOSTNAME=$(yq -e '.tenant.hostname' configs/env/play.yml)" >> $GITHUB_ENV
+            echo "SOURCE_ENV_PORT=$(yq -e '.tenant.port'         configs/env/play.yml)" >> $GITHUB_ENV
+            echo "SOURCE_TYPE=$(yq -e '.tenant.type'             configs/env/play.yml)" >> $GITHUB_ENV
+          fi
 
-      # ── 5. Setup Java ───────────────────────────────────────────────────────────────
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '11'
+          if [ -f "configs/repo.yml" ]; then
+            echo "REPO_USER=$(yq -e '.repo.user' configs/repo.yml)" >> $GITHUB_ENV
+          else
+            echo "REPO_USER=${{ vars.GIT_OWNER }}" >> $GITHUB_ENV
+          fi
+          echo "✅ Environment config loaded"
 
-      # ── 6. Cache webMethods Installation ────────────────────────────────────────────
-      - name: Cache webMethods Installation
-        id: cache-wm
-        uses: actions/cache@v3
-        with:
-          path: ${{ env.SAG_HOME }}
-          key: ${{ runner.os }}-webmethods-onprem-${{ hashFiles('**/project.properties') }}
-          restore-keys: |
-            ${{ runner.os }}-webmethods-onprem-
+      # ── 5. Verify IS connectivity before proceeding ───────────────────────────
+      - name: Verify Integration Server Connectivity
+        shell: bash
+        run: |
+          echo "=== Checking IS connectivity at ${IS_BASE_URL} ==="
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 15 \
+            -u "${{ secrets.IS_USER }}:${{ secrets.IS_PWD }}" \
+            "${IS_BASE_URL}/invoke/wm.server/ping" || echo "000")
 
-      # ── 7. Create repo and required branches ────────────────────────────────────────
-      - name: Create Repo and Required Branches
+          if [ "$HTTP_STATUS" == "200" ]; then
+            echo "✅ IS is reachable (HTTP $HTTP_STATUS)"
+          else
+            echo "::error::Cannot reach IS at ${IS_BASE_URL} — HTTP status: $HTTP_STATUS"
+            echo "Check IS_HOST, IS_PORT vars and ensure IS is running"
+            exit 1
+          fi
+
+      # ── 6. Check if target repository exists on GitHub ───────────────────────
+      - name: Check Target Repository Exists
+        shell: bash
         env:
           PAT: ${{ secrets.PAT }}
-          GH_TOKEN: ${{ secrets.PAT }}
         run: |
-          HOME_DIR="${GITHUB_WORKSPACE}/../"
+          echo "=== Checking if repo '${{ github.event.inputs.repoName }}' exists ==="
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${PAT}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${REPO_USER}/${{ github.event.inputs.repoName }}")
 
-          # Check if repository exists
-          REPO_EXISTS=$(gh repo view ${{ env.REPO_PATH }} > /dev/null 2>&1 && echo "true" || echo "false")
-          
-          if [ "$REPO_EXISTS" == "false" ]; then
-            echo "Creating new repository..."
-            gh repo create ${{ env.REPO_PATH }} --private --clone
-            
-            cd ${{ github.event.inputs.repoName }}
-            
-            # Initialize with project structure
-            mkdir -p assets/IS/Packages
-            mkdir -p assets/IS/Tests
-            mkdir -p assets/IS/config
-            mkdir -p assets/BPM
-            mkdir -p assets/MWS
-            mkdir -p assets/Rules
-            mkdir -p assets/UniversalMessaging
-            
-            # Copy project files
-            cp ../project.properties .
-            cp ../build.xml .
-            cp ../README.md .
-            
-            # Create .gitignore
-            cat > .gitignore << 'EOF'
-          target/
-          build/
-          report/
-          *.log
-          .DS_Store
-          .env
-          EOF
-            
-            # Initial commit
-            git add .
-            git commit -m "Initial project structure"
-            git push origin main
-            
-            # Create production branch
-            git checkout -b production
-            git push origin production
-            
-            # Create feature branch
-            git checkout -b ${{ github.event.inputs.featureBranchName }}
-            git push origin ${{ github.event.inputs.featureBranchName }}
-            
-            cd ..
+          if [ "$HTTP_STATUS" == "200" ]; then
+            echo "REPO_EXISTS=true" >> $GITHUB_ENV
+            echo "ℹ️  Repository exists — will sync feature branch"
+          elif [ "$HTTP_STATUS" == "404" ]; then
+            echo "REPO_EXISTS=false" >> $GITHUB_ENV
+            echo "ℹ️  Repository does not exist — will initialize new repo"
           else
-            echo "Repository already exists"
-            
-            # Clone and create feature branch if needed
-            git clone https://${REPO_USER}:${PAT}@github.com/${{ env.REPO_PATH }}.git
-            cd ${{ github.event.inputs.repoName }}
-            
-            branchExists=$(git ls-remote --exit-code --heads origin ${{ github.event.inputs.featureBranchName }} || true)
-            
-            if [ -z "${branchExists// }" ]; then
-              echo "Creating feature branch from production..."
-              git checkout production
-              git checkout -b ${{ github.event.inputs.featureBranchName }}
-              git push origin ${{ github.event.inputs.featureBranchName }}
-            else
-              echo "Feature branch already exists"
-              git checkout ${{ github.event.inputs.featureBranchName }}
-            fi
-            
-            cd ..
+            echo "::error::GitHub API check failed (HTTP $HTTP_STATUS)"
+            exit 1
           fi
 
-      # ── 8. Build packages ───────────────────────────────────────────────────────────
-      - name: Build webMethods Packages
+      # ── 7a. NEW REPO: Create repo, branches and IS package ───────────────────
+      - name: Initialize New Repository
+        if: env.REPO_EXISTS == 'false'
+        shell: bash
         env:
-          DEPLOYER_USERNAME: ${{ secrets.DEPLOYER_USERNAME }}
-          DEPLOYER_PASSWORD: ${{ secrets.DEPLOYER_PASSWORD }}
-          TARGET_IS_USERNAME: ${{ secrets.TARGET_IS_USERNAME }}
-          TARGET_IS_PASSWORD: ${{ secrets.TARGET_IS_PASSWORD }}
+          PAT:         ${{ secrets.PAT }}
+          IS_USER:     ${{ secrets.IS_USER }}
+          IS_PWD:      ${{ secrets.IS_PWD }}
         run: |
-          echo "Starting build process..."
-          
-          # Configure System.properties for CI assets
-          cat > ${{ env.SAG_CI_HOME }}/System.properties << EOF
-          deployerInstallationPath=${{ env.SAG_HOME }}/IntegrationServer/instances/default/packages/WmDeployer/bin/
-          deployerHost=${{ env.DEPLOYER_HOST }}
-          deployerPort=${{ env.DEPLOYER_PORT }}
-          deployerUsername=${DEPLOYER_USERNAME}
-          deployerPassword=${DEPLOYER_PASSWORD}
-          testISHost=${{ env.TARGET_IS_HOST }}
-          testISPort=${{ env.TARGET_IS_PORT }}
-          testISUsername=${TARGET_IS_USERNAME}
-          testISPassword=${TARGET_IS_PASSWORD}
-          EOF
-          
-          # Set up Ant path
-          export ANT_HOME=${{ env.SAG_HOME }}/common/lib/ant
-          export PATH=$ANT_HOME/bin:$PATH
-          
-          # Run build
-          cd ${{ github.event.inputs.repoName }}
-          ant -f build.xml build \
-            -DSAGHome=${{ env.SAG_HOME }} \
-            -DSAG_CI_HOME=${{ env.SAG_CI_HOME }} \
-            -DprojectName=${{ github.event.inputs.repoName }} \
-            -Dworkspace.dir=${{ github.workspace }}/${{ github.event.inputs.repoName }}
+          echo "=== Initializing new repository: ${{ github.event.inputs.repoName }} ==="
+          HOME_DIR="${GITHUB_WORKSPACE}"
 
-      # ── 9. Upload Build Artifacts ───────────────────────────────────────────────────
-      - name: Upload Build Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ github.event.inputs.repoName }}_build_${{ github.run_number }}
-          path: |
-            ${{ github.event.inputs.repoName }}/target/
-            !${{ github.event.inputs.repoName }}/target/**/*.log
-          retention-days: 30
+          # ── Create GitHub repository ────────────────────────────────────────
+          echo "Creating GitHub repository..."
+          CREATE_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST \
+            -H "Authorization: token ${PAT}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/orgs/${REPO_USER}/repos" \
+            -d "{
+              \"name\": \"${{ github.event.inputs.repoName }}\",
+              \"private\": true,
+              \"auto_init\": true,
+              \"default_branch\": \"main\"
+            }")
 
-      # ── 10. Build Summary ───────────────────────────────────────────────────────────
-      - name: Build Summary
-        run: |
-          echo "## Initialize Pipeline Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- **Status**: ✅ Success" >> $GITHUB_STEP_SUMMARY
-          echo "- **Repository**: ${{ github.event.inputs.repoName }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Feature Branch**: ${{ github.event.inputs.featureBranchName }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Build Number**: ${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Build All**: ${{ github.event.inputs.buildAll }}" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ github.event.inputs.buildAll }}" != "true" ]; then
-            echo "- **Packages**: ${{ github.event.inputs.packageList }}" >> $GITHUB_STEP_SUMMARY
+          HTTP_CODE=$(echo "$CREATE_RESPONSE" | tail -1)
+          if [ "$HTTP_CODE" != "201" ] && [ "$HTTP_CODE" != "422" ]; then
+            echo "::error::Failed to create repository (HTTP $HTTP_CODE)"
+            exit 1
           fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
-          echo "1. Review build artifacts" >> $GITHUB_STEP_SUMMARY
-          echo "2. Run tests using the test pipeline" >> $GITHUB_STEP_SUMMARY
-          echo "3. Deploy to target environment" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Repository created (or already exists)"
+
+          # ── Clone the new repo ──────────────────────────────────────────────
+          cd "${HOME_DIR}"
+          rm -rf "./${{ github.event.inputs.repoName }}"
+          git clone \
+            "https://${REPO_USER}:${PAT}@github.com/${REPO_USER}/${{ github.event.inputs.repoName }}.git"
+
+          cd "${{ github.event.inputs.repoName }}"
+
+          # ── Create standard branches ────────────────────────────────────────
+          for BRANCH in development staging production; do
+            git checkout -b "${BRANCH}" 2>/dev/null || git checkout "${BRANCH}"
+            git push origin "${BRANCH}" --set-upstream 2>/dev/null || true
+          done
+
+          # ── Create feature branch from development ──────────────────────────
+          git checkout development
+          git checkout -b "${{ github.event.inputs.featureBranchName }}"
+          git push origin "${{ github.event.inputs.featureBranchName }}" --set-upstream
+          echo "✅ Created branches: development, staging, production, ${{ github.event.inputs.featureBranchName }}"
+
+          # ── Create IS package via REST API ──────────────────────────────────
+          echo "=== Creating IS package: ${PACKAGE_NAME} ==="
+          PKG_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X PUT \
+            -u "${IS_USER}:${IS_PWD}" \
+            "${IS_BASE_URL}/invoke/wm.server.packages/packageCreate?packageName=${PACKAGE_NAME}")
+
+          if [ "$PKG_RESPONSE" == "200" ]; then
+            echo "✅ IS package '${PACKAGE_NAME}' created"
+          else
+            echo "::warning::Package create returned HTTP $PKG_RESPONSE — may already exist"
+          fi
+
+          # ── Create project-config.yml ───────────────────────────────────────
+          echo "Creating project-config.yml..."
+          cat > project-config.yml <<EOF
+          project:
+            project-name: "${{ github.event.inputs.repoName }}"
+            package-name: "${PACKAGE_NAME}"
+            is-host: "${{ vars.IS_HOST }}"
+            is-port: "${{ vars.IS_PORT }}"
+            source-type: "onprem"
+          EOF
+
+          git config user.email "cicd@noemail.com"
+          git config user.name "${{ github.event.inputs.devUser }}"
+          git add project-config.yml
+          git commit -m "Initialize: add project configuration [skip ci]"
+          git push origin "${{ github.event.inputs.featureBranchName }}"
+          echo "✅ project-config.yml pushed to ${{ github.event.inputs.featureBranchName }}"
+
+      # ── 7b. EXISTING REPO: Sync feature branch ───────────────────────────────
+      - name: Sync Existing Repository
+        if: env.REPO_EXISTS == 'true'
+        shell: bash
+        env:
+          PAT:     ${{ secrets.PAT }}
+          IS_USER: ${{ secrets.IS_USER }}
+          IS_PWD:  ${{ secrets.IS_PWD }}
+        run: |
+          echo "=== Syncing existing repository: ${{ github.event.inputs.repoName }} ==="
+          HOME_DIR="${GITHUB_WORKSPACE}"
+
+          # ── Clone from production branch ────────────────────────────────────
+          rm -rf "./${{ github.event.inputs.repoName }}"
+          git clone -b production \
+            "https://${REPO_USER}:${PAT}@github.com/${REPO_USER}/${{ github.event.inputs.repoName }}.git"
+          cd "${{ github.event.inputs.repoName }}"
+
+          # ── Check if feature branch exists ──────────────────────────────────
+          BRANCH_EXISTS=$(git ls-remote --exit-code --heads origin \
+            "${{ github.event.inputs.featureBranchName }}" || true)
+
+          if [ -n "${BRANCH_EXISTS// }" ]; then
+            echo "ℹ️  Branch '${{ github.event.inputs.featureBranchName }}' already exists — skipping creation"
+          else
+            echo "Branch does not exist — creating from production..."
+
+            git checkout -b "${{ github.event.inputs.featureBranchName }}"
+            git config user.email "cicd@noemail.com"
+            git config user.name "${{ github.event.inputs.devUser }}"
+            git push origin "${{ github.event.inputs.featureBranchName }}" --set-upstream
+            echo "✅ Feature branch created from production"
+
+            # ── Create or verify IS package exists ──────────────────────────
+            echo "Ensuring IS package exists for dev environment..."
+            PKG_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X PUT \
+              -u "${IS_USER}:${IS_PWD}" \
+              "${IS_BASE_URL}/invoke/wm.server.packages/packageCreate?packageName=${PACKAGE_NAME}")
+            echo "Package create response: HTTP $PKG_RESPONSE"
+
+            # ── Deploy candidate to DEV via WmDeployer ───────────────────────
+            if [ "${SYNC_MODE}" == "full" ]; then
+              echo "=== Full package sync via WmDeployer ==="
+              "${{ vars.DEPLOYER_BAT }}" \
+                -deploy \
+                -project "${{ github.event.inputs.repoName }}_Project" \
+                -dc "${{ github.event.inputs.repoName }}_Candidate" \
+                -host "${{ vars.IS_HOST }}" \
+                -port "${{ vars.IS_PORT }}" \
+                -user "${{ secrets.IS_USER }}" \
+                -pwd  "${{ secrets.IS_PWD }}"
+              DEPLOY_STATUS=$?
+            else
+              echo "=== Partial asset sync via WmDeployer ==="
+              echo "Assets to sync: ${ASSET_ID_LIST}"
+              echo "Asset types:    ${ASSET_TYPE_LIST}"
+              # Partial deploy — candidate should be pre-scoped to specific assets
+              "${{ vars.DEPLOYER_BAT }}" \
+                -deploy \
+                -project "${{ github.event.inputs.repoName }}_Project" \
+                -dc "${{ github.event.inputs.repoName }}_Partial_Candidate" \
+                -host "${{ vars.IS_HOST }}" \
+                -port "${{ vars.IS_PORT }}" \
+                -user "${{ secrets.IS_USER }}" \
+                -pwd  "${{ secrets.IS_PWD }}"
+              DEPLOY_STATUS=$?
+            fi
+
+            if [ $DEPLOY_STATUS -eq 0 ]; then
+              echo "✅ WmDeployer deployment successful"
+            else
+              echo "::error::WmDeployer deployment failed — check Deployer logs"
+              exit 1
+            fi
+          fi
+
+      # ── 8. Reload IS package after deployment ─────────────────────────────────
+      - name: Reload IS Package
+        shell: bash
+        env:
+          IS_USER: ${{ secrets.IS_USER }}
+          IS_PWD:  ${{ secrets.IS_PWD }}
+        run: |
+          echo "=== Reloading IS package: ${PACKAGE_NAME} ==="
+          RELOAD_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X GET \
+            -u "${IS_USER}:${IS_PWD}" \
+            "${IS_BASE_URL}/invoke/wm.server.packages/packageReload?packageName=${PACKAGE_NAME}")
+
+          if [ "$RELOAD_STATUS" == "200" ]; then
+            echo "✅ Package reloaded successfully"
+          else
+            echo "::warning::Package reload returned HTTP $RELOAD_STATUS — manual reload may be required"
+          fi
+
+      # ── 9. Run post-deploy health check ───────────────────────────────────────
+      - name: Post-Deploy Health Check
+        shell: bash
+        env:
+          IS_USER: ${{ secrets.IS_USER }}
+          IS_PWD:  ${{ secrets.IS_PWD }}
+        run: |
+          echo "=== Post-deploy health check ==="
+          sleep 5
+
+          HEALTH=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 20 \
+            -u "${IS_USER}:${IS_PWD}" \
+            "${IS_BASE_URL}/invoke/wm.server/ping")
+
+          if [ "$HEALTH" == "200" ]; then
+            echo "✅ IS health check passed"
+          else
+            echo "::warning::IS health check returned HTTP $HEALTH — IS may need attention"
+          fi
+
+      # ── 10. Summary report ────────────────────────────────────────────────────
+      - name: Pipeline Summary
+        if: always()
+        shell: bash
+        run: |
+          echo "=============================================="
+          echo "        INITIALIZE PIPELINE SUMMARY          "
+          echo "=============================================="
+          echo "  Repository  : ${{ github.event.inputs.repoName }}"
+          echo "  Branch      : ${{ github.event.inputs.featureBranchName }}"
+          echo "  Sync Mode   : ${SYNC_MODE}"
+          echo "  Dev User    : ${{ github.event.inputs.devUser }}"
+          echo "  IS Target   : ${IS_BASE_URL}"
+          echo "  Package     : ${PACKAGE_NAME}"
+          echo "  Triggered by: ${{ github.actor }}"
+          echo "  Run ID      : ${{ github.run_id }}"
+          echo "=============================================="
 
 # Made with Bob
