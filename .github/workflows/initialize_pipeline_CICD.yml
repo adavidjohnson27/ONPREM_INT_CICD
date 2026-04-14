@@ -1,0 +1,253 @@
+##############################################################################################################
+#                                                                                                            #
+# initialize_pipeline.yml : Initialize OnPrem webMethods project and build/deploy pipeline                  #
+# GitHub Actions - Adapted for webMethods OnPrem from iPaaS pipeline                                        #
+#                                                                                                            #
+# ####### Inputs ########                                                                                    #
+# packageList:        (Optional) Comma separated list of IS package names to build                          #
+# testPackageList:    (Optional) Comma separated list of test package names                                 #
+# devUser:            (Optional) UserID for commits and audit                                                #
+# featureBranchName:  (Mandatory) Name of the feature branch                                                 #
+# repoName:           (Mandatory) Name of the corresponding repository                                       #
+# buildAll:           (Mandatory) True to build all packages in the project                                  #
+##############################################################################################################
+
+name: Initialize OnPrem Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      packageList:
+        description: "(Optional) Comma separated list of IS package names"
+        required: false
+        default: ""
+      testPackageList:
+        description: "(Optional) Comma separated list of test package names"
+        required: false
+        default: ""
+      devUser:
+        description: "(Optional) User ID for commits and audit"
+        required: false
+        default: ""
+      featureBranchName:
+        description: "(Mandatory) Name of the feature branch"
+        required: true
+      repoName:
+        description: "(Mandatory) Name of the corresponding repository"
+        required: true
+      buildAll:
+        description: "(Mandatory) Set to 'true' to build all packages"
+        required: true
+        default: "false"
+
+env:
+  INIT: "true"
+  REPO_PATH: "${{ vars.GIT_OWNER }}/${{ github.event.inputs.repoName }}"
+  SAG_HOME: ${{ github.workspace }}/sag_home
+  SAG_CI_HOME: ${{ github.workspace }}/sagdevops-ci-assets
+
+jobs:
+  initialize:
+    runs-on: self-hosted
+
+    steps:
+      # ── 1. Checkout Repository ──────────────────────────────────────────────────────
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: "true"
+          persist-credentials: "true"
+          clean: "true"
+
+      # ── 2. Checkout CI Assets ───────────────────────────────────────────────────────
+      - name: Checkout CI Assets
+        uses: actions/checkout@v4
+        with:
+          repository: SoftwareAG/sagdevops-ci-assets
+          path: sagdevops-ci-assets
+          ref: master
+
+      # ── 3. Adjust variables when buildAll = true ────────────────────────────────────
+      - name: Adjust Variables for Full Build
+        if: ${{ github.event.inputs.buildAll == 'true' }}
+        run: |
+          echo "PACKAGE_LIST=ALL"      >> $GITHUB_ENV
+          echo "TEST_PACKAGE_LIST=ALL" >> $GITHUB_ENV
+
+      - name: Set Package Variables from Inputs
+        if: ${{ github.event.inputs.buildAll != 'true' }}
+        run: |
+          echo "PACKAGE_LIST=${{ github.event.inputs.packageList }}"         >> $GITHUB_ENV
+          echo "TEST_PACKAGE_LIST=${{ github.event.inputs.testPackageList }}" >> $GITHUB_ENV
+
+      # ── 4. Get environment configuration ────────────────────────────────────────────
+      - name: Get Environment Configuration
+        run: |
+          pwd
+          ls -ltr
+
+          # Set default values for OnPrem environment
+          echo "DEPLOYER_HOST=${{ secrets.DEPLOYER_HOST || 'localhost' }}"     >> $GITHUB_ENV
+          echo "DEPLOYER_PORT=${{ secrets.DEPLOYER_PORT || '5555' }}"          >> $GITHUB_ENV
+          echo "TARGET_IS_HOST=${{ secrets.TARGET_IS_HOST || 'localhost' }}"   >> $GITHUB_ENV
+          echo "TARGET_IS_PORT=${{ secrets.TARGET_IS_PORT || '5555' }}"        >> $GITHUB_ENV
+          echo "REPO_USER=${{ vars.GIT_OWNER }}"                               >> $GITHUB_ENV
+
+      # ── 5. Setup Java ───────────────────────────────────────────────────────────────
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '11'
+
+      # ── 6. Cache webMethods Installation ────────────────────────────────────────────
+      - name: Cache webMethods Installation
+        id: cache-wm
+        uses: actions/cache@v3
+        with:
+          path: ${{ env.SAG_HOME }}
+          key: ${{ runner.os }}-webmethods-onprem-${{ hashFiles('**/project.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-webmethods-onprem-
+
+      # ── 7. Create repo and required branches ────────────────────────────────────────
+      - name: Create Repo and Required Branches
+        env:
+          PAT: ${{ secrets.PAT }}
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          HOME_DIR="${GITHUB_WORKSPACE}/../"
+
+          # Check if repository exists
+          REPO_EXISTS=$(gh repo view ${{ env.REPO_PATH }} > /dev/null 2>&1 && echo "true" || echo "false")
+          
+          if [ "$REPO_EXISTS" == "false" ]; then
+            echo "Creating new repository..."
+            gh repo create ${{ env.REPO_PATH }} --private --clone
+            
+            cd ${{ github.event.inputs.repoName }}
+            
+            # Initialize with project structure
+            mkdir -p assets/IS/Packages
+            mkdir -p assets/IS/Tests
+            mkdir -p assets/IS/config
+            mkdir -p assets/BPM
+            mkdir -p assets/MWS
+            mkdir -p assets/Rules
+            mkdir -p assets/UniversalMessaging
+            
+            # Copy project files
+            cp ../project.properties .
+            cp ../build.xml .
+            cp ../README.md .
+            
+            # Create .gitignore
+            cat > .gitignore << 'EOF'
+          target/
+          build/
+          report/
+          *.log
+          .DS_Store
+          .env
+          EOF
+            
+            # Initial commit
+            git add .
+            git commit -m "Initial project structure"
+            git push origin main
+            
+            # Create production branch
+            git checkout -b production
+            git push origin production
+            
+            # Create feature branch
+            git checkout -b ${{ github.event.inputs.featureBranchName }}
+            git push origin ${{ github.event.inputs.featureBranchName }}
+            
+            cd ..
+          else
+            echo "Repository already exists"
+            
+            # Clone and create feature branch if needed
+            git clone https://${REPO_USER}:${PAT}@github.com/${{ env.REPO_PATH }}.git
+            cd ${{ github.event.inputs.repoName }}
+            
+            branchExists=$(git ls-remote --exit-code --heads origin ${{ github.event.inputs.featureBranchName }} || true)
+            
+            if [ -z "${branchExists// }" ]; then
+              echo "Creating feature branch from production..."
+              git checkout production
+              git checkout -b ${{ github.event.inputs.featureBranchName }}
+              git push origin ${{ github.event.inputs.featureBranchName }}
+            else
+              echo "Feature branch already exists"
+              git checkout ${{ github.event.inputs.featureBranchName }}
+            fi
+            
+            cd ..
+          fi
+
+      # ── 8. Build packages ───────────────────────────────────────────────────────────
+      - name: Build webMethods Packages
+        env:
+          DEPLOYER_USERNAME: ${{ secrets.DEPLOYER_USERNAME }}
+          DEPLOYER_PASSWORD: ${{ secrets.DEPLOYER_PASSWORD }}
+          TARGET_IS_USERNAME: ${{ secrets.TARGET_IS_USERNAME }}
+          TARGET_IS_PASSWORD: ${{ secrets.TARGET_IS_PASSWORD }}
+        run: |
+          echo "Starting build process..."
+          
+          # Configure System.properties for CI assets
+          cat > ${{ env.SAG_CI_HOME }}/System.properties << EOF
+          deployerInstallationPath=${{ env.SAG_HOME }}/IntegrationServer/instances/default/packages/WmDeployer/bin/
+          deployerHost=${{ env.DEPLOYER_HOST }}
+          deployerPort=${{ env.DEPLOYER_PORT }}
+          deployerUsername=${DEPLOYER_USERNAME}
+          deployerPassword=${DEPLOYER_PASSWORD}
+          testISHost=${{ env.TARGET_IS_HOST }}
+          testISPort=${{ env.TARGET_IS_PORT }}
+          testISUsername=${TARGET_IS_USERNAME}
+          testISPassword=${TARGET_IS_PASSWORD}
+          EOF
+          
+          # Set up Ant path
+          export ANT_HOME=${{ env.SAG_HOME }}/common/lib/ant
+          export PATH=$ANT_HOME/bin:$PATH
+          
+          # Run build
+          cd ${{ github.event.inputs.repoName }}
+          ant -f build.xml build \
+            -DSAGHome=${{ env.SAG_HOME }} \
+            -DSAG_CI_HOME=${{ env.SAG_CI_HOME }} \
+            -DprojectName=${{ github.event.inputs.repoName }} \
+            -Dworkspace.dir=${{ github.workspace }}/${{ github.event.inputs.repoName }}
+
+      # ── 9. Upload Build Artifacts ───────────────────────────────────────────────────
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.repoName }}_build_${{ github.run_number }}
+          path: |
+            ${{ github.event.inputs.repoName }}/target/
+            !${{ github.event.inputs.repoName }}/target/**/*.log
+          retention-days: 30
+
+      # ── 10. Build Summary ───────────────────────────────────────────────────────────
+      - name: Build Summary
+        run: |
+          echo "## Initialize Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ✅ Success" >> $GITHUB_STEP_SUMMARY
+          echo "- **Repository**: ${{ github.event.inputs.repoName }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Feature Branch**: ${{ github.event.inputs.featureBranchName }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build Number**: ${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build All**: ${{ github.event.inputs.buildAll }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event.inputs.buildAll }}" != "true" ]; then
+            echo "- **Packages**: ${{ github.event.inputs.packageList }}" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Review build artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "2. Run tests using the test pipeline" >> $GITHUB_STEP_SUMMARY
+          echo "3. Deploy to target environment" >> $GITHUB_STEP_SUMMARY
+
+# Made with Bob
